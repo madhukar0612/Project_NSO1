@@ -1,0 +1,165 @@
+#!/bin/bash
+
+openrc=$1
+tag=$2
+ssh_private=$3
+ssh_public="${ssh_private}.pub"
+node_count=3
+
+source "$openrc" || { printf "Failed to source openrc file\n" >&2; exit 1; }
+sudo chmod 600 "$ssh_private"
+sudo chmod 600 "$ssh_public" || { printf "Failed to set permissions for SSH public key\n" >&2; exit 1; }
+
+echo "$(date) Initialising Cleanup"
+
+network="${tag}_network"
+subnet="${tag}_subnet"
+keypair="${tag}_keypair"
+router="${tag}_router"
+securitygroup="${tag}_securitygroup"
+proxy1="${tag}_HAproxy1"
+proxy2="${tag}_HAproxy2"
+bastion="${tag}_bastion"
+nodes="${tag}_dev"
+vip_port="${tag}_vip"
+sshconfig="${tag}_config"
+known_hosts="known_hosts"
+inventory_file="hosts"
+
+# Function to delete servers
+delete_servers() {
+    nametag=$1
+    server_ids=$(openstack server list --name "$nametag" -c ID -f value)
+    a=$(echo "$server_ids" | wc -l)
+    if [[ -n "$server_ids" ]]; then
+        echo "$(date) There are $a servers in total"
+        echo "$(date) Deleting servers..."
+        for server_id in $server_ids; do
+            openstack server delete "$server_id" || printf "Failed to delete server %s\n" "$server_id" >&2
+        done
+        echo "$(date) Deleted $a servers successfully"
+    else
+        echo "$(date) No Servers are present to delete"
+    fi
+}
+
+# Function to delete floating IPs
+delete_floating_ips() {
+    floating_ips=$(openstack floating ip list -c ID -f value)
+    a=$(echo "$floating_ips" | wc -l)
+    if [[ -n "$floating_ips" ]]; then
+        for floating_ip in $floating_ips; do
+            echo "$(date) Deleting floating IP"
+            openstack floating ip delete "$floating_ip" || printf "Failed to delete floating IP %s\n" "$floating_ip" >&2
+        done
+        echo "$(date) Deleted $a floating IPs successfully"
+    else
+        echo "$(date) Floating IPs not present"
+    fi
+}
+
+# Function to disconnect router from subnet
+disconnect_router_from_subnet() {
+    router_name=$1
+    router_id=$(openstack router list | grep "${router_name}" | awk '{print $2}')
+    if [[ -n "${router_id}" ]]; then
+        echo "$(date) Router '${router_name}' found with ID: ${router_id}"
+        subnet_id=$(openstack router show "${router_id}" -f json | jq -r '.interfaces_info[].subnet_id')
+        openstack router remove subnet "${router_id}" "${subnet_id}" || printf "Failed to remove subnet %s from router %s\n" "$subnet_id" "$router_id" >&2
+        echo "$(date) Disconnected router from subnet"
+    else
+        echo "$(date) Router '${router_name}' is not present"
+    fi
+}
+
+# Function to delete router
+delete_router() {
+    router_name=$1
+    router_id=$(openstack router list | grep -w "${router_name}" | awk '{print $2}')
+    if [[ -n "${router_id}" ]]; then
+        echo "$(date) Deleting router"
+        openstack router delete "${router_id}" || printf "Failed to delete router %s\n" "$router_id" >&2
+        echo "$(date) Router '${router_name}' deleted successfully"
+    else
+        echo "$(date) Router '${router_name}' is not present"
+    fi
+}
+
+# Function to delete subnets
+delete_subnets() {
+    subnet_name=$1
+    subnet_id=$(openstack subnet list | grep -w "${subnet_name}" | awk '{print $2}')
+    if [[ -n "${subnet_id}" ]]; then
+        echo "$(date) Deleting subnet"
+        openstack subnet delete "${subnet_id}" || printf "Failed to delete subnet %s\n" "$subnet_id" >&2
+        echo "$(date) Subnet '${subnet_name}' deleted successfully"
+    else
+        echo "$(date) Subnet '${subnet_name}' is not present"
+    fi
+}
+
+# Function to delete virtual port
+delete_virtual_port() {
+    echo "$(date) Deleting virtual port"
+    openstack port delete "$vip_port" || printf "Failed to delete virtual port %s\n" "$vip_port" >&2
+    echo "$(date) Deleted virtual port"
+}
+
+# Function to delete networks
+delete_networks() {
+    nametag=$1
+    network_ids=$(openstack network list --tags "$nametag" -c ID -f value)
+    if [[ -n "$network_ids" ]]; then
+        for network_id in $network_ids; do
+            openstack network delete "$network_id" || printf "Failed to delete network %s\n" "$network_id" >&2
+        done
+        echo "$(date) Deleted network"
+    else
+        echo "$(date) Network is not present"
+    fi
+}
+
+# Function to delete security groups
+delete_security_groups() {
+    security_group_name=$1
+    openstack security group delete "$security_group_name" || printf "Failed to delete security group %s\n" "$security_group_name" >&2
+    echo "$(date) Security group deleted"
+}
+
+# Function to delete keypairs
+delete_keypairs() {
+    keypair_name=$1
+    if openstack keypair show "$keypair_name" > /dev/null 2>&1; then
+        echo "$(date) Keypair $keypair_name exists"
+        openstack keypair delete "$keypair_name" || printf "Failed to delete keypair %s\n" "$keypair_name" >&2
+        echo "$(date) Keypair $keypair_name deleted"
+    else
+        echo "$(date) Keypair $keypair_name does not exist"
+    fi
+}
+
+# Main function
+main() {
+    delete_servers "$tag"
+    delete_floating_ips
+    disconnect_router_from_subnet "$router"
+    delete_router "$router"
+    delete_virtual_port
+    delete_subnets "$subnet"
+    delete_networks "$tag"
+    delete_security_groups "$securitygroup"
+    delete_keypairs "$keypair"
+
+    echo "$(date) Removing unwanted files"
+    files=("$sshconfig" "$known_hosts" "$inventory_file" "floating1" "floating2" "vipaddr" "unused" "node_count.txt")
+
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]]; then
+            rm "$file" || printf "Failed to remove file %s\n" "$file" >&2
+        fi
+    done
+    echo "$(date) Done"
+    echo "$(date) Cleanup completed successfully"
+}
+
+main "$@"
