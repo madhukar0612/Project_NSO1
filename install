@@ -1,0 +1,332 @@
+#!/bin/bash
+
+#Variables
+openrc=$1
+tag_name=$2
+ssh_private=$3
+ssh_public="${ssh_private}.pub"
+node_count=3
+
+source "$openrc"
+
+#Setting required permissions
+sudo chmod 600 "$ssh_private"
+sudo chmod 600 "$ssh_public"
+
+
+#chmod 600 "$openrc"
+
+echo "$(date) Starting deployment of $tag using $openrc for credentials"
+
+network_name="$2_network"
+subnet_name="$2_subnet"
+keypair_name="$2_keypair"
+router_name="$2_router"
+securitygroup_name="$2_securitygroup"
+haproxy1="$2_HAproxy1"
+haproxy2="$2_HAproxy2"
+bastion_server="$2_bastion"
+nodes="$2_dev"
+vip_port="$2_vip"
+sshconfig="$2_config"
+known_hosts="known_hosts"
+inventory_file="hosts"
+
+#Clean up existing files
+[[ -f "$sshconfig" ]] && rm "$sshconfig"
+[[ -f "$known_hosts" ]] && rm "$known_hosts"
+[[ -f "$inventory_file" ]] && rm "$inventory_file"
+
+#Keypair
+existing_keypairs=$(openstack keypair list -f value --column Name)
+if ! grep -qFx "$keypair_name" <<< "$existing_keypairs"; then
+    keypair_create=$(openstack keypair create --public-key "$ssh_public" "$keypair_name")
+    echo "$(date) $keypair_name created successfully"
+else
+    echo "$(date) $keypair_name already exists"
+fi
+
+#Network
+existing_networks=$(openstack network list -f value --column Name)
+if ! grep -qFx "$network_name" <<< "$existing_networks"; then
+    network_create=$(openstack network create --tag "$tag_name" "$network_name" -f json)
+    echo "$(date) $network_name created successfully"
+else
+    echo "$(date) $network_name already exists"
+fi
+
+#Subnet
+existing_subnets=$(openstack subnet list -f value --column Name)
+if ! grep -qFx "$subnet_name" <<< "$existing_subnets"; then
+    subnet_create=$(openstack subnet create --tag "$tag_name" --network "$network_name" --subnet-range 10.0.1.0/27 --gateway 10.0.1.1 "$subnet_name")
+    echo "$(date) $subnet_name created successfully"
+else
+    echo "$(date) $subnet_name already exists"
+fi
+
+#Router
+existing_routers=$(openstack router list -f value --column Name)
+if ! grep -qFx "$router_name" <<< "$existing_routers"; then
+    router_create=$(openstack router create --tag "$tag_name" "$router_name")
+    echo "$(date) $router_name created successfully"
+    #Adding subnet and external gateway to the router
+    gatewaysetting=$(openstack router set --external-gateway ext-net "$router_name")
+    addingsubnet=$(openstack router add subnet "$router_name" "$subnet_name")
+else
+    echo "$(date) $router_name already exists"
+fi
+
+#Security group
+existing_secgrps=$(openstack security group list -f value --column Name)
+if echo "$existing_secgrps" | grep -qFx "$securitygroup_name"; then
+    echo "$(date) $securitygroup_name already exists"
+else
+    echo "$(date) Creating security group"
+    secgrp_create=$(openstack security group create --tag "$tag_name" "$securitygroup_name" -f shell)
+    echo "$(date) Adding rules to security group"
+    rule1=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 22 --protocol tcp --ingress "$securitygroup_name")
+    rule2=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 80 --protocol icmp --ingress "$securitygroup_name")
+    rule3=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 5000 --protocol tcp --ingress "$securitygroup_name")
+    rule4=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 8080 --protocol tcp --ingress "$securitygroup_name")
+    rule5=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 6000 --protocol udp --ingress "$securitygroup_name")
+    rule6=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 9090 --protocol tcp --ingress "$securitygroup_name")
+    rule7=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 9100 --protocol tcp --ingress "$securitygroup_name")
+    rule8=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 3000 --protocol tcp --ingress "$securitygroup_name")
+    rule9=$(openstack security group rule create --remote-ip 0.0.0.0/0 --dst-port 161 --protocol udp --ingress "$securitygroup_name")
+    rule10=$(openstack security group rule create --protocol 112 "$securitygroup_name")
+    echo "$(date) Security group created successfully"
+fi
+
+#Floating IPs
+floating_ip_present=$(openstack floating ip list -c 'Floating IP Address' -f value)
+openstack floating ip list -c 'Floating IP Address' -f value > unused
+line_count=$(wc -l < unused)
+
+if (( "$line_count" == 0 )); then
+    echo "$(date) No floating IPs are present"
+    echo "$(date) Creating 2 floating IPs"
+    create_floating_ip1=$(openstack floating ip create ext-net -f value --column floating_ip_address > floating1)
+    create_floating_ip2=$(openstack floating ip create ext-net -f value --column floating_ip_address > floating2)
+    f1=$(cat floating1)
+    f2=$(cat floating2)
+    echo "$(date) $f1 created for bastion"
+    echo "$(date) $f2 created for HAproxy(s)"
+elif (( "$line_count" == 1 )); then
+    echo "$(date) Only 1 floating IP is present"
+    sleep 5
+    echo "$(date) Creating another floating IP and using the available floating IP"
+    index=1
+    while read -r ip; do
+        # Save each IP address into a separate file
+        echo "$ip" > "floating$index"
+        echo "$(date) Floating IP $index: $ip saved to floating$index"
+        index=$((index + 1))
+    done <<< "$floating_ip_present"
+    create_floating_ip2=$(openstack floating ip create ext-net -f value --column floating_ip_address > floating2)
+    f1=$(cat floating1)
+    f2=$(cat floating2)
+    echo "$(date) $f1 created for bastion"
+    echo "$(date) $f2 created for HAproxy(s)"
+else
+    echo "$(date) Floating IPs are available"
+    index=1
+    while read -r ip; do
+        # Save each IP address into a separate file
+        echo "$ip" > "floating$index"
+        echo "$(date) Floating IP $index: $ip saved to floating$index"
+        index=$((index + 1))
+    done <<< "$floating_ip_present"
+    f1=$(cat floating1)
+    f2=$(cat floating2)
+    echo "$(date) $f1 for bastion"
+    echo "$(date) $f2 for HAproxy(s)"
+fi
+
+#Virtual IP port
+existing_ports=$(openstack port list --network "$network_name" -f value --column Name)
+if grep -qFx "$vip_port" <<< "$existing_ports"; then
+    echo "$(date) Virtual port $vip_port already exists"
+else
+    echo "$(date) Creating a virtual port"
+    virtual_port=$(openstack port create --network "$network_name" --fixed-ip subnet="$subnet_name" --no-security-group "$vip_port")
+    echo "$(date) Virtual port $vip_port created successfully"
+fi
+
+#HAproxy(s)
+proxy_present=$(openstack server list -f value --column Name)
+if [[ "$proxy_present" == *"$haproxy1"* ]]; then
+    echo "$(date) $haproxy1 already exists"
+else
+    echo "$(date) Creating $haproxy1 server"
+    create_proxy1=$(openstack server create --image "Ubuntu 20.04 Focal Fossa x86_64" --key-name "$keypair_name" --flavor "1C-2GB-50GB" --network "$network_name" --security-group "$securitygroup_name" "$haproxy1")
+    sleep 5
+    echo "$(date) $haproxy1 created"
+fi
+if [[ "$proxy_present" == *"$haproxy2"* ]]; then
+   echo "$(date) $haproxy2 already exists"
+else
+    echo "$(date) Creating $haproxy2 server"
+    create_proxy2=$(openstack server create --image "Ubuntu 20.04 Focal Fossa x86_64" --key-name "$keypair_name" --flavor "1C-2GB-50GB" --network "$network_name" --security-group "$securitygroup_name" "$haproxy2")
+    sleep 5
+    echo "$(date) $haproxy2 created"
+fi
+
+echo "$(date) Attaching floating IP to virtual port"
+fip_attach_vpt=$(openstack floating ip set --port "$vip_port" "$f2")
+echo "$(date) Extracting fixed IP of the virtual port"
+fip_vip_port=$(openstack port show "$vip_port" -f value -c fixed_ips | grep -Po '\d+\.\d+\.\d+\.\d+' | awk 'NR==1')
+echo "$fip_vip_port" >> vipaddr
+echo "$(date) Updating the virtual port"
+portupdate=$(openstack port set --allowed-address ip-address="$f2" "$vip_port")
+
+echo "$(date) Extracting fixed IPs of the proxy servers"
+HAPfixedip1=$(openstack server show "$haproxy1" -c addresses | grep -Po '\d+\.\d+\.\d+\.\d+' | awk 'NR==1')
+HAPfixedip2=$(openstack server show "$haproxy2" -c addresses | grep -Po '\d+\.\d+\.\d+\.\d+' | awk 'NR==1')
+echo "$(date) Attaching fixed IPs to ports"
+pid_HA1=$(openstack port list --fixed-ip ip-address="$HAPfixedip1" -c ID -f value)
+pid_HA2=$(openstack port list --fixed-ip ip-address="$HAPfixedip2" -c ID -f value)
+echo "$(date) Updating ports"
+update_port1=$(openstack port set --allowed-address ip-address="$fip_vip_port" "$pid_HA1")
+update_port2=$(openstack port set --allowed-address ip-address="$fip_vip_port" "$pid_HA2")
+
+#Bastion
+bastion_present=$(openstack server list -f value --column Name)
+if [[ "$bastion_present" == *"$bastion_server"* ]]; then
+    echo "$(date) $bastion_server already exists"
+else
+    echo "$(date) Creating $bastion_server server"
+    create_bastion=$(openstack server create --image "Ubuntu 20.04 Focal Fossa x86_64" --key-name "$keypair_name" --flavor "1C-2GB-50GB" --network "$network_name" --security-group "$securitygroup_name" "$bastion_server")
+    sleep 10
+    echo "$(date) $bastion_server created"
+    # Fetching port ID for the bastion instance
+    port_id_bastion=$(openstack port list --fixed-ip ip-address="$(openstack server show "$bastion_server" -f value -c addresses | grep -Po '10\.\d+\.\d+\.\d+')" -f value -c ID)
+    echo "$(date) Attaching floating IP"
+    if [[ -n "$port_id_bastion" ]]; then
+        add_float_bastion=$(openstack floating ip set --port "$port_id_bastion" "$f1")
+        echo "$(date) $bastion_server created and floating IP $f1 attached"
+    else
+        echo "$(date) No Port found for $bastion_server"
+    fi
+fi
+
+#Function to create web servers
+web_servers() {
+    nodelist=$(openstack server list --column Name -f value)
+    totalnodes=$(grep -c "$nodes" <<< "$nodelist")
+
+    for ((i=0; i<totalnodes; i++))
+    do
+        a=$(("$i"+1))
+        name=${nodes}${a}
+        ip_address=$(openstack server list --name "$name" -c Networks -f value | grep -Po  '\d+\.\d+\.\d+\.\d+')
+        echo " " >> "$sshconfig"
+        echo "Host $name" >> "$sshconfig"
+        echo "   User ubuntu" >> "$sshconfig"
+        echo "   HostName $ip_address" >> "$sshconfig"
+        echo "   IdentityFile $PWD/$1" >> "$sshconfig"
+        echo "   UserKnownHostsFile=~/dev/null" >> "$sshconfig"
+        echo "   StrictHostKeyChecking no" >> "$sshconfig"
+        echo "   PasswordAuthentication no" >> "$sshconfig"
+        echo "   ProxyJump $bastion_server" >> "$sshconfig" 
+        echo "$name" >> "$inventory_file"
+done
+}
+
+dev_present=$(openstack server list -f value --column Name)
+dev_count=$(grep -ocP "$nodes" <<< "$dev_present")
+if (("$node_count" > "$dev_count")); then
+    add_nodes=$((node_count - dev_count))
+    echo "$(date) $add_nodes servers need to be added"
+    echo "[webservers]" >> "$inventory_file"
+    for ((i=0; i<add_nodes; i++)); do
+        a=$((i+1))
+        nodes_name="${nodes}${a}"
+        server_create=$(openstack server create --image "Ubuntu 20.04 Focal Fossa x86_64" "$nodes_name" --key-name "$keypair_name" --flavor "1C-2GB-50GB" --network "$network_name" --security-group "$securitygroup_name")
+        echo "$(date) Server $nodes_name created"
+        echo "$(date) Waiting for the server to become active"
+    
+        # Wait until the server is active
+        server_status=""
+        while [ "$server_status" != "ACTIVE" ]; do
+            sleep 5
+            server_status=$(openstack server show "$nodes_name" -c status -f value)
+        done
+
+        echo "$(date) Server $nodes_name is active"
+    done
+    web_servers $ssh_private
+elif (("$node_count" < "$dev_count")); then
+    del_nodes=$(("$dev_count" - "$node_count"))
+    echo "$(date) $del_nodes need to be removed"
+    stop=0
+    
+    if (("$del_nodes" > "$stop")); then
+        echo "[webservers]" >> "$inventory_file"
+        for ((i=del_nodes; i>0; i--)); do
+            server_delete=$(openstack server list --status ACTIVE -f value -c Name | grep -m1 -oP "$tag"'_dev([1-9]+)')
+            serverremove=$(openstack server delete "$server_delete" --wait)
+            sleep 5
+        done
+        web_servers $ssh_private
+    fi
+else
+    echo "$(date) Required Number of servers $node_count, are already present"
+fi
+
+# Generate config file
+echo "$(date) Generating config file"
+echo " " >> "$sshconfig"
+echo "Host $bastion_server" >> "$sshconfig"
+echo "   User ubuntu" >> "$sshconfig"
+echo "   HostName $f1" >> "$sshconfig"
+echo "   IdentityFile $PWD/$ssh_private" >> "$sshconfig"
+echo "   UserKnownHostsFile /dev/null" >> "$sshconfig"
+echo "   StrictHostKeyChecking no" >> "$sshconfig"
+echo "   PasswordAuthentication no" >> "$sshconfig"
+
+echo " " >> "$sshconfig"
+echo "Host $haproxy1" >> "$sshconfig"
+echo "   User ubuntu" >> "$sshconfig"
+echo "   HostName $HAPfixedip1" >> "$sshconfig"
+echo "   IdentityFile $PWD/$ssh_private" >> "$sshconfig"
+echo "   StrictHostKeyChecking no" >> "$sshconfig"
+echo "   PasswordAuthentication no ">> "$sshconfig"
+echo "   ProxyJump $bastion_server" >> "$sshconfig"
+
+echo " " >> "$sshconfig"
+echo "Host $haproxy2" >> "$sshconfig"
+echo "   User ubuntu" >> "$sshconfig"
+echo "   HostName $HAPfixedip2" >> "$sshconfig"
+echo "   IdentityFile $PWD/$ssh_private" >> "$sshconfig"
+echo "   StrictHostKeyChecking no" >> "$sshconfig"
+echo "   PasswordAuthentication no ">> "$sshconfig"
+echo "   ProxyJump $bastion_server" >> "$sshconfig"
+
+# Generate hosts file
+echo "$(date) Generating hosts file"
+echo " " >> "$inventory_file"
+echo "[bastion]" >> "$inventory_file"
+echo "$bastion_server" >> "$inventory_file"
+echo " " >> "$inventory_file"
+echo "[HAproxy]" >> "$inventory_file"
+echo "$haproxy1" >> "$inventory_file"
+echo "$haproxy2" >> "$inventory_file"
+echo " " >> "$inventory_file"
+echo " " >> "$inventory_file"
+echo "[primary_proxy]" >> "$inventory_file"
+echo "$haproxy1" >> "$inventory_file"
+echo " " >> "$inventory_file"
+echo "[backup_proxy]" >> "$inventory_file"
+echo "$haproxy2" >> "$inventory_file"
+echo " " >> "$inventory_file"
+echo "[all:vars]" >> "$inventory_file"
+echo "ansible_user=ubuntu" >> "$inventory_file"
+echo "ansible_ssh_common_args=\"-F $sshconfig\"" >> "$inventory_file"
+
+no_of_nodes=$(openstack server list | grep "$nodes" | wc -l > node_count.txt)
+
+echo "$(date) Initialising ansible-playbook..."
+ansible-playbook -i hosts -user='root' --ssh-extra-args='-p 22 -o ConnectionAttempts=10 -o StrictHostKeyChecking=no' site.yaml
+
+echo "$(date) $f1 created for bastion server"
+echo "$(date) $f2 created for HAproxy servers"
