@@ -157,7 +157,7 @@ do
         if ((nodes_to_delete > stop)); then
             echo "[webservers]" >> "$inventory_file"
             for ((i=nodes_to_delete; i>0; i--)); do
-                server_delete=$(openstack server list --status ACTIVE -f value -c Name | grep -m1 -oP "${tag}_dev([1-9]+)")
+                server_delete=$(openstack server list --status ACTIVE -f value -c Name | grep -m1 -oP "${tag_name}_dev([1-9]+)")
                 serveremove=$(openstack server delete "$server_delete" --wait)
                 sleep 5
             done
